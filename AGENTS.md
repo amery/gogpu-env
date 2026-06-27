@@ -135,6 +135,18 @@ For workflows that drive a host-side tool from inside the container
 (e.g. `chrome-devtools-mcp` tunnelling to a visible Chrome on the
 host), use this alias.
 
+#### Local LLM access (Ollama)
+
+The image bakes `/etc/profile.d/ollama.sh` (see `docker/Dockerfile`), so
+login shells point CLI clients — Ollama's own client and srclight's
+embedding backend — at a host Ollama daemon on
+`host.docker.internal:11434`. It is a silent no-op when the alias does
+not resolve or the variables are already set. Like the SSH path, it
+relies on the host daemon being reachable over `docker0`: Ollama
+listening on the bridge (or all interfaces) and the host firewall
+permitting `docker0` → port 11434. The variables set are listed under
+[Environment Variables](./README.md#environment-variables) in README.md.
+
 #### Host-side prerequisites
 
 - **`sshd` must listen on the bridge interface** for SSH-from-container
