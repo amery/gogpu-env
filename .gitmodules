@@ -1,0 +1,32 @@
+[submodule "src/github.com/gogpu/wgpu"]
+	path = src/github.com/gogpu/wgpu
+	url = https://github.com/gogpu/wgpu
+	branch = main
+[submodule "src/github.com/born-ml/born"]
+	path = src/github.com/born-ml/born
+	url = https://github.com/born-ml/born
+	branch = main
+[submodule "src/github.com/go-webgpu/goffi"]
+	path = src/github.com/go-webgpu/goffi
+	url = https://github.com/go-webgpu/goffi
+	branch = main
+[submodule "src/github.com/odvcencio/gotreesitter"]
+	path = src/github.com/odvcencio/gotreesitter
+	url = https://github.com/odvcencio/gotreesitter
+	branch = main
+[submodule "src/github.com/blevesearch/bleve"]
+	path = src/github.com/blevesearch/bleve
+	url = https://github.com/blevesearch/bleve
+	branch = master
+[submodule "src/github.com/srclight/srclight"]
+	path = src/github.com/srclight/srclight
+	url = https://github.com/srclight/srclight
+	branch = develop
+[submodule "src/github.com/viterin/vek"]
+	path = src/github.com/viterin/vek
+	url = https://github.com/viterin/vek
+	branch = master
+[submodule "src/github.com/coder/hnsw"]
+	path = src/github.com/coder/hnsw
+	url = https://github.com/coder/hnsw
+	branch = main
