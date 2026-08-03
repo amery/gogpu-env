@@ -19,6 +19,8 @@ accurate and synchronised.
 - **Trampoline**: `x` → `run.sh` → docker-builder-run → container
 - **Passthrough**: `run.sh` detects `/.dockerenv` and skips docker
 - **Host Alias**: container reaches host as `host.docker.internal`
+- **GPU**: host render nodes exposed per kernel driver, via
+  `docker/gpu.sh`
 
 ## Dual Execution Architecture
 
@@ -200,6 +202,86 @@ ssh -o BatchMode=yes -o ConnectTimeout=5 host.docker.internal true
 path reached `sshd`; only auth remains (mount `~/.ssh` or forward
 the agent via `$SSH_AUTH_SOCK`).
 
+## GPU Passthrough
+
+Both execution modes expose the host GPUs to the webgpu (Vulkan)
+backend. The discrimination and the render-node inventory live in
+`docker/gpu.sh`, sourced by `docker/run.sh` for CLI mode and by
+`.devcontainer/init.sh` for DevContainer mode; each shapes the result
+into the form its launcher takes — a flat `DOCKER_EXTRA_OPTS` string on
+one side, `runArgs` tokens on the other.
+
+### Driver Discrimination
+
+The discriminator is the kernel driver bound to the render node, read
+from `/sys/class/drm/<node>/device/driver` — not the "open versus
+proprietary" label:
+
+- **Mesa drivers** (`i915`, `xe`, `amdgpu`, `nouveau`, …): the
+  `/dev/dri` render node is passed through with `--device` and the
+  in-image Mesa Vulkan stack (anv, radv, NVK) drives it
+- **`nvidia`**, proprietary *or* NVIDIA's open kernel modules: the
+  render node is skipped, because it yields no Vulkan device — the
+  access path is the NVIDIA userspace ICD via `/dev/nvidia*`, and Mesa
+  NVK binds only nouveau. The GPU is reached through the NVIDIA
+  Container Toolkit instead (`--gpus all`, plus
+  `NVIDIA_DRIVER_CAPABILITIES=all` for the `graphics` capability the
+  toolkit otherwise withholds), and only when `nvidia-ctk` is present
+  on the host; without it the request is dropped rather than failing
+  the run
+
+A GPU-less host adds nothing: the glob stays literal and every
+candidate fails the device test.
+
+### Group Membership
+
+A passed-through render node is owned by a host gid with no matching
+container group. The workspace user cannot open it unaided, and a gid
+that resolves to no name is upsetting in its own right — everything
+that reports group membership shows the bare number. The
+`15-gpu-render.sh` entrypoint plugin answers both: create or reuse a
+**named** group with the node's gid, then enrol the user. Each mode
+runs it at the point where it still has root:
+
+- **CLI**: the entrypoint sources the plugin at container start with
+  the device attached, so the gid is read from `/dev/dri`; the later
+  `su -` inherits the group
+- **DevContainer**: there is no root phase at runtime — the user is
+  PID 1 and VS Code overrides the entrypoint — so the group is baked
+  into the image instead. `gen_dockerfile` appends a build step
+  running the same plugin, with the host's gids in `GPU_RENDER_GIDS`
+  because a build has no device to read them from. The image's
+  `/etc/group` carries the named group, and the container starts with
+  it in the user's credentials
+
+Two details of that build step are load-bearing. It is emitted after
+`/devcontainer-init.sh`, which is where the workspace user gets its
+final name — before that it is still `vscode`. And the gids travel on
+that one `RUN` rather than as an `ENV`, so the plugin stays a no-op
+when `gen_profile` sources it during the earlier step.
+
+`runArgs` therefore carries only the device; a build cannot attach
+one. It is regenerated in full on every init and merged with replace
+semantics, so re-runs stay idempotent instead of accumulating duplicate
+`--device` entries. On a host with a GPU the regenerated array differs
+from the committed baseline; that difference is host-specific and is
+not meant to be committed.
+
+Device and capability requirements would ideally travel with the image
+in a `run-hook.sh`, which is where docker-builder's design puts them.
+That mechanism is image-distributed — the workspace copy is extracted
+from the image and overwritten on mismatch — so adopting it means
+shipping the hook from docker-builder rather than authoring one here.
+Until then this stays in `run.sh` and `init.sh`.
+
+### Diagnostics
+
+From inside a container:
+
+```bash
+vulkaninfo --summary   # Vulkan ICDs and devices
+```
+
 ## How Initialisation Works
 
 The initialisation provides cross-platform flexibility through a Node.js
@@ -227,6 +309,8 @@ Key functions in platform scripts:
 - `gen_dockerfile`: Extends base Dockerfile with user metadata
   - Uses `containerUser` in metadata label (not `remoteUser`)
   - Removes verbose shell execution (`sh` instead of `sh -x`)
+  - Appends the GPU render group build step when `gen_gpu_gids` finds
+    a passed-through node (see [Group Membership](#group-membership))
 - `gen_json_overlay`: Creates mount configuration including:
   - Sandboxed home directory mount
   - Claude directory bind mount
@@ -256,6 +340,8 @@ Key functions in platform scripts:
      present locally, then reads its metadata with `docker inspect`
    - Appends user-specific configuration:
      - Runs `/devcontainer-init.sh` with username and home path
+     - Enrols that user in the host's GPU render group, when there is
+       one
      - Sets container user to match host user
      - Adds devcontainer metadata label with `containerUser` field
    - **Platform differences**:

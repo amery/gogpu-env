@@ -11,6 +11,9 @@ development environments with intelligent host integration.
   and state persistence
 - **GPG Signing**: Forwards host GPG agent socket into the container
   for commit and tag signing
+- **GPU Passthrough**: Exposes host render nodes to the webgpu (Vulkan)
+  backend in both execution modes, by the mechanism each kernel driver
+  needs (see [AGENTS.md](./AGENTS.md#gpu-passthrough))
 - **Smart Mount System**: Selective bind mounts preserve tool configurations
   while isolating the container
 - **Automatic Setup**: Self-configuring initialisation script
@@ -85,7 +88,8 @@ process:
   `/C/Users/john`)
 - Pulls the base image on first run (if not already present) to read its
   metadata
-- Generates a custom Dockerfile with user-specific metadata
+- Generates a custom Dockerfile with user-specific metadata, and with
+  the host's GPU render group when there is one
 
 ## Project Structure
 
@@ -102,6 +106,7 @@ process:
 
 docker/              # Base container definitions
 ├── Dockerfile       # Base image configuration
+├── gpu.sh           # Host GPU discovery (sourced by both modes)
 └── run.sh          # Container runtime script
 
 run.sh              # Symlink to docker/run.sh (workspace root marker)

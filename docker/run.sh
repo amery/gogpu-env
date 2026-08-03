@@ -1,34 +1,26 @@
 #!/bin/sh
 
+# local is not in POSIX sh but is supported by the target shells (dash,
+# bash); it is used by gen_gpu_opts below.
+# shellcheck disable=SC3043
 set -eu
 
-# gen_gpu_opts — emit the `docker run` options that expose the host GPUs
-# to the Vulkan (webgpu) backend, each by the mechanism its driver needs.
-# The discriminator is the kernel driver bound to the render node (read
-# from sysfs), not the "open vs proprietary" label:
-#
-#   nouveau / i915 / xe / amdgpu / …  — any Mesa driver
-#       Pass the /dev/dri render node: the in-image Mesa Vulkan stack
-#       (anv, radv, NVK) drives it. The 15-gpu-render.sh entrypoint plugin
-#       enrols the user in the node's group so it is openable.
-#
-#   nvidia  — proprietary *or* NVIDIA's open kernel modules
-#       Skip the render node: it yields no Vulkan device, since the access
-#       path is the NVIDIA userspace ICD (via /dev/nvidia*), not the DRM
-#       node, and Mesa NVK only binds nouveau. Reach the GPU through the
-#       NVIDIA Container Toolkit instead (--gpus), requested only when
-#       nvidia-ctk is installed.
-#
-# Emits nothing on a GPU-less host: the glob stays literal and every
-# candidate fails the device test.
+# gen_gpu_opts
+# Shape gpu.sh's render-node inventory into one flat `docker run` option
+# string for CLI mode. The per-driver rationale lives in gpu.sh; what is
+# specific here is the shape. The node's gid is not needed on this path:
+# the 15-gpu-render.sh entrypoint plugin reads it off the live device as
+# root and enrols the user before the drop to it. Emits nothing when no
+# GPU is exposed.
 gen_gpu_opts() {
-	local dev drv nvidia_gpu= opts=
+	local dev drv nvidia_gpu='' opts=''
 
-	for dev in /dev/dri/renderD*; do
-		[ -c "$dev" ] || continue
+	while read -r dev drv _; do
+		# the inventory is empty on a GPU-less host, leaving a single
+		# blank line to skip
+		[ -n "$dev" ] || continue
 
-		drv=$(readlink -f "/sys/class/drm/${dev##*/}/device/driver" 2> /dev/null || true)
-		case "${drv##*/}" in
+		case "$drv" in
 		nvidia)
 			nvidia_gpu=1
 			;;
@@ -36,14 +28,16 @@ gen_gpu_opts() {
 			opts="${opts:+$opts }--device $dev"
 			;;
 		esac
-	done
+	done <<-EOT
+	$(gpu_each_render_node)
+	EOT
 
 	# An NVIDIA proprietary GPU is reachable only through the NVIDIA
 	# Container Toolkit; without nvidia-ctk the render node is dead and
 	# --gpus is rejected, so drop the GPU. NVIDIA_DRIVER_CAPABILITIES=all
 	# adds the `graphics` cap the Vulkan backend needs — the toolkit
 	# otherwise exposes only compute+utility.
-	command -v nvidia-ctk > /dev/null 2>&1 || nvidia_gpu=
+	gpu_has_nvidia_ctk || nvidia_gpu=''
 	[ -z "$nvidia_gpu" ] || opts="${opts:+$opts }--gpus all -e NVIDIA_DRIVER_CAPABILITIES=all"
 
 	[ -z "$opts" ] || printf '%s\n' "$opts"
@@ -104,6 +98,12 @@ else
 	export DOCKER_DIR="${ME%/*}"
 	export DOCKER_RUN_WS="${DOCKER_DIR%/*}"
 
+	# host GPU discovery, shared with .devcontainer/init.sh; only the
+	# host path needs it, so it is sourced here rather than at the top
+	# shellcheck source-path=SCRIPTDIR
+	# shellcheck source=gpu.sh
+	. "$DOCKER_DIR/gpu.sh"
+
 	# bind-mount Claude configuration. docker-builder-run reads a bare
 	# name off DOCKER_RUN_VOLUMES as a variable to resolve, so pass the
 	# directory as CLAUDE_CONFIG_DIR; a leading ! marks .claude.json as a
@@ -118,12 +118,17 @@ else
 	# forward GPG agent socket for commit signing
 	GPG_SOCK_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/gnupg"
 	if [ -d "$GPG_SOCK_DIR" ]; then
+		# docker-builder-run evaluates DOCKER_EXTRA_OPTS as a command
+		# line, so the embedded quotes are deliberate: they survive to
+		# keep a path with spaces one argument.
+		# shellcheck disable=SC2089
 		export DOCKER_EXTRA_OPTS="${DOCKER_EXTRA_OPTS:+$DOCKER_EXTRA_OPTS }-v '$GPG_SOCK_DIR:$GPG_SOCK_DIR'"
 	fi
 
 	# expose host as host.docker.internal — Docker resolves the
 	# host-gateway sentinel to the bridge gateway IP at container
 	# start, replacing the brittle pattern of hard-coding 172.17.0.1.
+	# shellcheck disable=SC2090
 	export DOCKER_EXTRA_OPTS="${DOCKER_EXTRA_OPTS:+$DOCKER_EXTRA_OPTS }--add-host=host.docker.internal:host-gateway"
 
 	# expose the host GPUs for the Vulkan (webgpu) backend (see

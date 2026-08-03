@@ -6,6 +6,9 @@ FROM quay.io/amery/docker-apptly-builder:latest
 # implementation that returns correct results with no GPU — plus the
 # Intel anv ICD for the Arc render node when one is passed in.
 # vulkan-tools provides vulkaninfo for diagnostics.
+#
+# Compute only: this container has no display, so nothing here serves
+# presentation.
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
       mesa-vulkan-drivers \
@@ -33,34 +36,56 @@ if [ -z "${OPENAI_BASE_URL:-}" -a -n "${OLLAMA_HOST:-}" ]; then
 fi
 SH
 
-# Enrol the workspace user in the GPU render node's group at container
-# init so the webgpu (Vulkan) backend can open a render device passed
-# in via --device. Inlined (not COPY) so it behaves identically under
-# docker-builder-run and the generated devcontainer build, matching the
-# profile.d pattern. entrypoint.d plugins are sourced as root after the
-# user is created, before the drop to it; their stdout is folded into
-# the login profile, so this must emit nothing there.
+# Enrol the workspace user in the GPU render node's group so the webgpu
+# (Vulkan) backend can open a render device passed in via --device. The
+# plugin serves both execution modes, at the moment each one has a root
+# phase: the entrypoint sources it at container start for CLI
+# (docker-builder-run), while the device is live, then drops to the user
+# via `su -`, which inherits the new group; the generated devcontainer
+# build runs it as a build step, where no device is attached and the
+# gids arrive in GPU_RENDER_GIDS instead (see gen_dockerfile in
+# .devcontainer/init.sh). Inlined (not COPY) to match the profile.d
+# pattern. entrypoint.d plugin stdout is folded into the login profile,
+# so this must emit nothing there.
 RUN cat > /etc/entrypoint.d/15-gpu-render.sh <<'SH'
 # A /dev/dri render node passed in via --device is owned by a host gid
-# with no matching container group, so the workspace user cannot open
-# it. Create or reuse a group with that gid and enrol the user, so the
-# later `su -` inherits the supplementary group. No-op when no device
-# is present. Keep stdout empty — gen_profile captures it.
-for _dev in /dev/dri/renderD*; do
-	# the glob stays literal when no render node is present — the only
-	# expected miss, and the plugin's no-op exit. Past here a failure is
-	# a real broken state: let set -e abort init loudly rather than ship
-	# a user who silently cannot open the GPU.
-	[ -c "$_dev" ] || continue
+# with no matching container group: the user cannot open the node, and
+# a gid that resolves to no name upsets everything that reports one.
+# Create or reuse a *named* group with that gid and enrol the workspace
+# user, so both the `su -` login and a devcontainer's baked credentials
+# carry it.
+#
+# The gid list has two sources, one per moment. At container start the
+# render nodes are attached, so it is read from /dev/dri. At devcontainer
+# image build time none is, so the host's gids are passed in through
+# GPU_RENDER_GIDS. No-op when neither yields one. Keep stdout empty —
+# gen_profile captures it.
+_gids="${GPU_RENDER_GIDS:-}"
+if [ -z "$_gids" ]; then
+	for _dev in /dev/dri/renderD*; do
+		# the glob stays literal when no render node is present — the
+		# only expected miss, and the plugin's no-op exit
+		[ -c "$_dev" ] || continue
 
-	_gid=$(stat -c %g "$_dev")
+		_gids="${_gids:+$_gids }$(stat -c %g "$_dev")"
+	done
+fi
+
+# past here a failure is a real broken state: let set -e abort loudly
+# rather than ship a user who silently cannot open the GPU
+for _gid in $_gids; do
 	_grp=$(getent group "$_gid" | cut -d: -f1)
 	if [ -z "$_grp" ]; then
-		groupadd -g "$_gid" render
 		_grp=render
+		if getent group "$_grp" > /dev/null; then
+			# a second node with a different gid cannot take the name
+			_grp="render$_gid"
+		fi
+
+		groupadd -g "$_gid" "$_grp"
 	fi
 
 	usermod -aG "$_grp" "$USER_NAME"
 done
-unset _dev _gid _grp
+unset _dev _gid _gids _grp
 SH

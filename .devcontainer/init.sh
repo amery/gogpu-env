@@ -119,6 +119,14 @@ rename() {
 	fi
 }
 
+# host GPU discovery, shared with docker/run.sh. It feeds both halves of
+# the DevContainer's GPU story: the render groups baked into the
+# generated Dockerfile (gen_gpu_gids) and the device passthrough in
+# runArgs (gen_gpu_runargs).
+# shellcheck source-path=SCRIPTDIR
+# shellcheck source=../docker/gpu.sh
+. docker/gpu.sh
+
 # Dockerfile
 #
 DOCKERFILE=docker/Dockerfile
@@ -148,8 +156,43 @@ metadata() {
 	get_metadata "$from" | jq -c '. + [{"containerUser": $USER}]' --arg USER "$USER"
 }
 
+# gen_gpu_gids
+# The gids the container user must belong to for the render nodes this
+# host passes through, space-separated and deduplicated. Only the nodes
+# that are passed through count: an nvidia node is skipped by gpu.sh's
+# policy, and the toolkit's /dev/nvidia* devices need no group. Empty on
+# a GPU-less host.
+gen_gpu_gids() {
+	local dev drv gid out=''
+
+	while read -r dev drv gid; do
+		# the inventory is empty on a GPU-less host (and on macOS),
+		# leaving a single blank line to skip
+		[ -n "$dev" ] || continue
+
+		case "$drv" in
+		nvidia)
+			continue
+			;;
+		esac
+
+		case " $out " in
+		*" $gid "*)
+			continue
+			;;
+		esac
+
+		out="${out:+$out }$gid"
+	done <<-EOT
+	$(gpu_each_render_node)
+	EOT
+
+	printf '%s\n' "$out"
+}
+
 gen_dockerfile() {
-	local from="$1"
+	local from="$1" gids
+	gids=$(gen_gpu_gids)
 
 	cat <<EOT
 $(cat "$DOCKERFILE")
@@ -157,6 +200,26 @@ $(cat "$DOCKERFILE")
 # bypassed entrypoint
 #
 RUN /devcontainer-init.sh "$USER" "$HOME" && rm -f /devcontainer-init.sh
+EOT
+
+	# The render group belongs to the image, not to runArgs: --group-add
+	# would put a nameless gid in the container's credentials, which
+	# every tool that resolves one then reports raw. Bake it here
+	# instead, as a named group the user belongs to. This runs the same
+	# entrypoint.d plugin CLI mode uses, but after /devcontainer-init.sh
+	# — until then the user is still called `vscode` — and with the gids
+	# passed per-RUN rather than as ENV, so the plugin stays a no-op when
+	# the profile generator sources it during that earlier step.
+	if [ -n "$gids" ]; then
+		cat <<EOT
+
+# GPU render group
+#
+RUN USER_NAME="$USER" GPU_RENDER_GIDS="$gids" sh /etc/entrypoint.d/15-gpu-render.sh
+EOT
+	fi
+
+	cat <<EOT
 
 # run as user
 #
@@ -177,6 +240,62 @@ trap "rm -f '$T'" EXIT
 gen_dockerfile "$FROM" > "$T"
 rename "$T" "$F"
 
+# runArgs
+#
+# gen_gpu_runargs
+# Shape gpu.sh's render-node inventory into runArgs tokens, one per line
+# for jq to assemble into the JSON array. The per-driver rationale lives
+# in gpu.sh. Only the device attachment belongs here — a build cannot
+# attach one — while the group the user needs to open it is baked into
+# the image by gen_dockerfile.
+gen_gpu_runargs() {
+	local dev drv nvidia_gpu=''
+
+	while read -r dev drv _; do
+		# the inventory is empty on a GPU-less host (and on macOS),
+		# leaving a single blank line to skip
+		[ -n "$dev" ] || continue
+
+		case "$drv" in
+		nvidia)
+			nvidia_gpu=1
+			;;
+		*)
+			printf '%s\n' '--device' "$dev"
+			;;
+		esac
+	done <<-EOT
+	$(gpu_each_render_node)
+	EOT
+
+	# without nvidia-ctk the render node is dead and --gpus is rejected,
+	# so drop the GPU. NVIDIA_DRIVER_CAPABILITIES=all adds the `graphics`
+	# cap the Vulkan backend needs — the toolkit otherwise exposes only
+	# compute+utility.
+	gpu_has_nvidia_ctk || nvidia_gpu=''
+
+	if [ -n "$nvidia_gpu" ]; then
+		printf '%s\n' '--gpus' 'all' '-e' 'NVIDIA_DRIVER_CAPABILITIES=all'
+	fi
+}
+
+# gen_runargs
+# Emit the full runArgs set, one token per line: the static base
+# (capabilities, security options, host alias) followed by any host GPU
+# passthrough. Regenerated in full on every init so the overlay can
+# replace runArgs wholesale (see gen_json_overlay) and stay idempotent —
+# appending would accumulate duplicate --device entries across re-runs.
+gen_runargs() {
+	printf '%s\n' \
+		'--cap-add=NET_ADMIN' \
+		'--cap-add=SYS_PTRACE' \
+		'--security-opt=apparmor:unconfined' \
+		'--security-opt=seccomp:unconfined' \
+		'--add-host=host.docker.internal:host-gateway'
+
+	gen_gpu_runargs
+}
+
 # devcontainer.json
 #
 # WS_ENV/HOME_ENV are devcontainer.json substitution tokens, written into the
@@ -188,6 +307,12 @@ readonly WS_ENV='${localWorkspaceFolder}'
 readonly HOME_ENV='${localEnv:HOME}'
 
 gen_json_overlay() {
+	# runArgs: static base plus any host GPU passthrough (see
+	# gen_runargs), regenerated whole and merged with replace semantics
+	# so re-runs stay idempotent.
+	local run_args
+	run_args=$(gen_runargs | jq -Rn '[inputs]' -c)
+
 	# GPG agent socket forwarding
 	local gpg_mount=""
 	local gpg_sock_dir="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/gnupg"
@@ -206,6 +331,7 @@ gen_json_overlay() {
 		"WS": "$WS_ENV",
 		"CURDIR": "$WS_ENV"
 	},
+	"runArgs": $run_args,
 	"workspaceMount": "source=$WS_ENV,target=$WS_ENV,type=bind,consistency=cached",
 	"workspaceFolder": "$WS_ENV",
 	"mounts": [{
